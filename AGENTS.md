@@ -1,30 +1,67 @@
 # HEY SDK -- Agent Instructions
 
-## Hard Rules
+Go client for the HEY API, generated from the Smithy spec in `spec/`.
 
-1. **Never hand-write API methods.** All operations are generated from the Smithy spec.
-2. **Never construct URL paths manually.** Use the generated route table.
-3. **Every new operation needs tests.** Unit tests per language + conformance tests.
-4. **Run `make check` before committing.** All checks must pass.
+**This repo ships Go only.** The Makefile still carries `ts-`, `rb-`, `swift-` and `kt-`
+targets inherited from the shared SDK seed. They `cd` into `typescript/`, `ruby/`,
+`swift/` and `kotlin/`, none of which exist here, so they fail immediately -- as does
+`make check-full`, which invokes them. `make check` is the gate that works.
+
+## Hard rules
+
+1. **Never hand-write API methods.** Operations are generated from the Smithy spec.
+2. **Never construct URL paths manually.** Use the generated route table -- no
+   `fmt.Sprintf` for paths.
+3. **Every new operation needs tests.** Go unit tests, plus a conformance test when the
+   change is behavioral.
+4. **Run `make check` before committing.**
 
 ## Pipeline
 
 ```
-Smithy spec -> OpenAPI -> Behavior Model -> Per-language generators -> SDK code
+spec/hey.smithy -> openapi.json -> oapi-codegen -> go/pkg/generated/client.gen.go
+                                                            |
+                                    hand-written wrappers in go/pkg/hey call into it
 ```
 
-## Anti-Patterns
+`openapi.json` and `go/pkg/generated/client.gen.go` are rebuilt from the spec; editing
+either by hand loses the change on the next generate. `go/pkg/hey` is **not** generated
+— those service wrappers are hand-written and you update them yourself.
 
-- Editing `openapi.json` directly (it is generated from Smithy)
-- Adding API methods without updating the Smithy spec
-- Skipping conformance tests for behavioral changes
-- Using `fmt.Sprintf` or template literals for API paths
+`go-check-drift` does not re-derive anything from the spec. It extracts the operations
+present in the checked-in `client.gen.go` and compares them with the `.gen.*WithResponse`
+calls in `go/pkg/hey`, failing when a wrapper calls an operation that no longer exists.
+So it catches wrappers left behind by a regenerate, not spec-vs-OpenAPI drift.
 
-## Development Workflow
+## Adding an operation
 
-1. Edit the Smithy spec in `spec/`
-2. Run `make smithy-build` to regenerate OpenAPI
-3. Run per-language generators: `make {lang}-generate-services`
-4. Add/update tests
-5. Run `make check`
-6. Commit
+1. Edit `spec/hey.smithy`
+2. `make smithy-build` -- regenerates `openapi.json`
+3. Refresh the three artifacts `smithy-build` leaves behind:
+
+   ```bash
+   make url-routes                      # go/pkg/hey/url-routes.json
+   ./scripts/generate-shape-fingerprint # spec/shape-fingerprint.json
+   ./scripts/generate-route-coverage    # spec/route-coverage.json
+   ```
+
+   Only the first has a make target; the other two are standalone scripts. They differ in
+   how `make check` treats them, which matters more:
+
+   - `url-routes-check` and `drift-check-shape` **do** verify freshness and fail on a
+     stale file, so forgetting those two is loud.
+   - Nothing verifies `spec/route-coverage.json`. `drift-check-forward` just consumes the
+     checked-in file and compares it against `spec/route-snapshot.json`, so a stale
+     coverage file does not fail the build — the gate passes while never looking at your
+     new endpoint. That one is on you to regenerate.
+4. `make go-generate` -- regenerates `go/pkg/generated/client.gen.go` via oapi-codegen.
+   Note the name: this repo has no `go-generate-services` target, unlike the seed's
+   vocabulary, and this step does not touch `go/pkg/hey`.
+5. Add or update the hand-written wrapper in `go/pkg/hey` so the operation is reachable
+6. Add Go unit tests, and a conformance case under `conformance/tests/` for behavioral
+   changes
+7. `make check`
+
+`make check` resolves to `check-mvp`: `smithy-check`, `behavior-model-check`,
+`drift-check-mvp`, `url-routes-check`, `go-check`, `go-check-drift` and
+`conformance-mvp`.
