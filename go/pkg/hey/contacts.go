@@ -51,17 +51,16 @@ func (s *ContactsService) Get(ctx context.Context, contactID int64) (result *gen
 		Service: "Contacts", Operation: "GetContact",
 		ResourceType: "contact", IsMutation: false, ResourceID: contactID,
 	}
-	if gater, ok := s.client.hooks.(GatingHooks); ok {
-		if ctx, err = gater.OnOperationGate(ctx, op); err != nil {
-			return
-		}
-	}
-	start := time.Now()
-	ctx = s.client.hooks.OnOperationStart(ctx, op)
-	defer func() { s.client.hooks.OnOperationEnd(ctx, op, err, time.Since(start)) }()
+	err = s.client.instrument(ctx, op, func(ctx context.Context) error {
+		result, err = s.get(ctx, contactID)
+		return err
+	})
+	return result, err
+}
 
-	s.client.initGeneratedClient()
-	resp, err := s.client.gen.GetContactWithResponse(ctx, contactID)
+// get is the un-instrumented read shared by Get and Update.
+func (s *ContactsService) get(ctx context.Context, contactID int64) (*generated.ContactDetail, error) {
+	resp, err := s.client.genClient().GetContactWithResponse(ctx, contactID)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +186,12 @@ func (s *ContactsService) Create(ctx context.Context, params ContactParams) (id 
 
 // Update edits a contact. Empty fields are left alone, except AliasEmailAddresses, which
 // replaces the whole list when it is non-nil.
+//
+// HEY's update is a full replacement (Contact::Ingress::Revise rewrites name, email and
+// removes any alias not submitted), so the current contact is read first and unset
+// fields are filled in from it before the form is sent. That read-then-write is not
+// atomic: a change made to the contact between the two requests is overwritten with
+// what was read. Pass every field explicitly when that matters.
 func (s *ContactsService) Update(ctx context.Context, contactID int64, params ContactParams) error {
 	op := OperationInfo{
 		Service: "Contacts", Operation: "UpdateContact",
@@ -194,7 +199,23 @@ func (s *ContactsService) Update(ctx context.Context, contactID int64, params Co
 	}
 
 	return s.client.instrument(ctx, op, func(ctx context.Context) error {
-		_, err := s.client.PatchForm(ctx, fmt.Sprintf("/contacts/%d", contactID), contactForm(params))
+		current, err := s.get(ctx, contactID)
+		if err != nil {
+			return err
+		}
+		merged := params
+		if merged.Name == "" {
+			merged.Name = current.Name
+		}
+		if merged.EmailAddress == "" {
+			merged.EmailAddress = current.EmailAddress
+		}
+		if merged.AliasEmailAddresses == nil {
+			for _, alias := range current.Aliases {
+				merged.AliasEmailAddresses = append(merged.AliasEmailAddresses, alias.EmailAddress)
+			}
+		}
+		_, err = s.client.PatchForm(ctx, fmt.Sprintf("/contacts/%d", contactID), contactForm(merged))
 		return err
 	})
 }
