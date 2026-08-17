@@ -54,10 +54,12 @@ func (s *TimeTracksService) GetOngoing(ctx context.Context) (result *generated.R
 	return resp.JSON200, nil
 }
 
-// Start starts a new time track.
+// Start starts a new time track and returns it as a recording.
 //
-// The body already carries the {calendar_time_track: {...}} wrapper the API expects.
-func (s *TimeTracksService) Start(ctx context.Context, body generated.StartTimeTrackJSONRequestBody) (result *generated.Recording, err error) {
+// It takes no parameters: haystack ignores the request body here and starts a
+// track with defaults. Set title/notes/category afterwards with Update. A 409
+// means a track is already ongoing.
+func (s *TimeTracksService) Start(ctx context.Context) (result *generated.Recording, err error) {
 	op := OperationInfo{
 		Service: "TimeTracks", Operation: "StartTimeTrack",
 		ResourceType: "time_track", IsMutation: true,
@@ -71,9 +73,14 @@ func (s *TimeTracksService) Start(ctx context.Context, body generated.StartTimeT
 	ctx = s.client.hooks.OnOperationStart(ctx, op)
 	defer func() { s.client.hooks.OnOperationEnd(ctx, op, err, time.Since(start)) }()
 
-	resp, err := s.client.genClient().StartTimeTrackWithResponse(ctx, body)
+	resp, err := s.client.genClient().StartTimeTrackWithResponse(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if resp.JSON409 != nil {
+		// A track is already running; hand back the server's message so the
+		// caller can branch on CodeConflict rather than parse a generic error.
+		return nil, ErrConflict(resp.JSON409.Error)
 	}
 	if err = CheckResponse(resp.HTTPResponse); err != nil {
 		return nil, err
@@ -89,15 +96,34 @@ func (s *TimeTracksService) Update(ctx context.Context, timeTrackID int64, body 
 		Service: "TimeTracks", Operation: "UpdateTimeTrack",
 		ResourceType: "time_track", IsMutation: true, ResourceID: timeTrackID,
 	}
-	if gater, ok := s.client.hooks.(GatingHooks); ok {
-		if ctx, err = gater.OnOperationGate(ctx, op); err != nil {
-			return
-		}
-	}
-	start := time.Now()
-	ctx = s.client.hooks.OnOperationStart(ctx, op)
-	defer func() { s.client.hooks.OnOperationEnd(ctx, op, err, time.Since(start)) }()
+	err = s.client.instrument(ctx, op, func(ctx context.Context) error {
+		result, err = s.update(ctx, timeTrackID, body)
+		return err
+	})
+	return result, err
+}
 
+// Stop stops an ongoing time track by setting ends_at to the current time.
+// It reports itself to hooks as StopTimeTrack, distinct from UpdateTimeTrack,
+// so a gating policy can allow one without the other; the request itself is
+// the same PUT that Update sends.
+func (s *TimeTracksService) Stop(ctx context.Context, timeTrackID int64) error {
+	op := OperationInfo{
+		Service: "TimeTracks", Operation: "StopTimeTrack",
+		ResourceType: "time_track", IsMutation: true, ResourceID: timeTrackID,
+	}
+	return s.client.instrument(ctx, op, func(ctx context.Context) error {
+		now := time.Now().UTC()
+		_, err := s.update(ctx, timeTrackID, generated.UpdateTimeTrackJSONRequestBody{
+			CalendarTimeTrack: generated.UpdateTimeTrackPayload{EndsAt: &now},
+		})
+		return err
+	})
+}
+
+// update is the shared PUT for Update and Stop: same request, same response
+// handling; only the announced operation differs.
+func (s *TimeTracksService) update(ctx context.Context, timeTrackID int64, body generated.UpdateTimeTrackJSONRequestBody) (*generated.Recording, error) {
 	resp, err := s.client.genClient().UpdateTimeTrackWithResponse(ctx, timeTrackID, body)
 	if err != nil {
 		return nil, err
@@ -106,15 +132,6 @@ func (s *TimeTracksService) Update(ctx context.Context, timeTrackID int64, body 
 		return nil, err
 	}
 	return resp.JSON200, nil
-}
-
-// Stop stops an ongoing time track by setting ends_at to the current time.
-func (s *TimeTracksService) Stop(ctx context.Context, timeTrackID int64) error {
-	now := time.Now().UTC()
-	_, err := s.Update(ctx, timeTrackID, generated.UpdateTimeTrackJSONRequestBody{
-		CalendarTimeTrack: generated.UpdateTimeTrackPayload{EndsAt: &now},
-	})
-	return err
 }
 
 // Create records a stretch of time that has already finished.

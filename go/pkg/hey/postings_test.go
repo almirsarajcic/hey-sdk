@@ -186,3 +186,62 @@ func TestPostingsService_ServerErrorSurfaced(t *testing.T) {
 		t.Fatal("expected error on 500")
 	}
 }
+
+// opRecorder captures the operation names announced to hooks.
+type opRecorder struct {
+	NoopHooks
+	ops []string
+}
+
+func (r *opRecorder) OnOperationStart(ctx context.Context, op OperationInfo) context.Context {
+	r.ops = append(r.ops, op.Operation)
+	return ctx
+}
+
+func TestTimeTracksService_StopAnnouncesItself(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"type":"TimeTrack"}`))
+	}))
+	t.Cleanup(srv.Close)
+	rec := &opRecorder{}
+	c := NewClient(&Config{BaseURL: srv.URL}, &StaticTokenProvider{Token: "t"}, WithMaxRetries(0), WithHooks(rec))
+	if err := c.TimeTracks().Stop(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.ops) != 1 || rec.ops[0] != "StopTimeTrack" {
+		t.Errorf("hooks saw %v, want exactly [StopTimeTrack] (not UpdateTimeTrack, and not both)", rec.ops)
+	}
+}
+
+func TestCheckResponse_ForbiddenMutationIsScopeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(&Config{BaseURL: srv.URL}, &StaticTokenProvider{Token: "t"}, WithMaxRetries(0))
+
+	err := c.Postings().Mute(context.Background(), 1) // POST through the generated client
+	if e := AsError(err); e == nil || e.Code != CodeForbidden || e.Hint == "" {
+		t.Errorf("mutation 403 should carry the scope hint, got %#v", err)
+	}
+	_, err = c.Boxes().List(context.Background()) // GET
+	if e := AsError(err); e == nil || e.Code != CodeForbidden || e.Hint != "" {
+		t.Errorf("read 403 should be a plain forbidden, got %#v", err)
+	}
+}
+
+func TestTimeTracksService_StartConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"Ongoing time track already in progress"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(&Config{BaseURL: srv.URL}, &StaticTokenProvider{Token: "t"}, WithMaxRetries(0))
+	_, err := c.TimeTracks().Start(context.Background())
+	e := AsError(err)
+	if e == nil || e.Code != CodeConflict || e.HTTPStatus != 409 || e.Message != "Ongoing time track already in progress" {
+		t.Fatalf("expected a conflict error carrying the server message, got %#v", err)
+	}
+}
