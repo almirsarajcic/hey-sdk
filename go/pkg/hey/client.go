@@ -221,6 +221,10 @@ func (c *Client) initGeneratedClient() {
 				req.Header.Set("Content-Type", "application/json")
 			}
 			req.Header.Set("Accept", "application/json")
+			req.URL.Path = withJSONExtension(req.URL.Path)
+			if req.URL.RawPath != "" {
+				req.URL.RawPath = withJSONExtension(req.URL.RawPath)
+			}
 			return nil
 		}
 		gen, err := generated.NewClientWithResponses(serverURL,
@@ -231,6 +235,21 @@ func (c *Client) initGeneratedClient() {
 		}
 		c.gen = gen
 	})
+}
+
+// withJSONExtension appends ".json" to a request path whose last segment has no
+// extension. HEY routes all take an optional format, and every generated operation
+// speaks JSON, but Smithy cannot express "{label}.json" inside one URI segment, so
+// operations that end in a path parameter are modelled without it and get it here.
+func withJSONExtension(path string) string {
+	if path == "" || strings.HasSuffix(path, "/") {
+		return path
+	}
+	last := path[strings.LastIndex(path, "/")+1:]
+	if strings.Contains(last, ".") {
+		return path
+	}
+	return path + ".json"
 }
 
 // discardHandler is a slog.Handler that discards all log records.
