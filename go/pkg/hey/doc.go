@@ -30,17 +30,18 @@
 // The SDK provides typed services for each HEY resource:
 //
 //   - [Client.Identity] - Current user identity and navigation
-//   - [Client.Boxes] - Mailboxes (imbox, feedbox, etc.)
-//   - [Client.Topics] - Email topics and views (sent, spam, trash, everything)
+//   - [Client.Boxes] - Mailboxes (the Imbox, The Feed, Paper Trail, ...) and box groups
+//   - [Client.Postings] - Bulk posting actions: seen, move, trash, spam, mute, file, bubble up
+//   - [Client.Topics] - Topics and views (sent, spam, trash, everything), status and moves
 //   - [Client.Messages] - Individual messages
-//   - [Client.Entries] - Drafts and replies
-//   - [Client.Contacts] - Contact management
+//   - [Client.Entries] - Drafts, replies and forwards
+//   - [Client.Contacts] - Contacts, notes, screening and bundling
 //   - [Client.Calendars] - Calendar views and recordings
-//   - [Client.CalendarTodos] - Calendar todo items
-//   - [Client.Habits] - Habit tracking
-//   - [Client.TimeTracks] - Time tracking
-//   - [Client.Journal] - Journal entries
-//   - [Client.Search] - Full-text search
+//   - [Client.CalendarTodos], [Client.CalendarEvents], [Client.Habits], [Client.TimeTracks], [Client.Journal] - What a calendar records
+//   - [Client.Search] - Search
+//   - [Client.Folders], [Client.Collections], [Client.Stickies], [Client.Clips], [Client.Snippets], [Client.Workflows] - Filing mail, and text kept to reuse
+//   - [Client.Publications] - Public links for threads
+//   - [Client.Designations], [Client.Extenzions], [Client.World] - Where mail lands, extra addresses, and HEY World
 //
 // # Working with Boxes
 //
