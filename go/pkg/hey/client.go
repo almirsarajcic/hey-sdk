@@ -57,6 +57,7 @@ type Client struct {
 	postings       *PostingsService
 	topics         *TopicsService
 	messages       *MessagesService
+	attachments    *AttachmentsService
 	entries        *EntriesService
 	bulkReplies    *BulkRepliesService
 	contacts       *ContactsService
@@ -272,6 +273,53 @@ func (c *Client) GetHTML(ctx context.Context, path string) (*Response, error) {
 	return c.doRequest(contextWithAccept(ctx, "text/html"), "GET", path, nil)
 }
 
+// GetBlob performs a same-origin GET request for binary content and bypasses
+// the response cache. It buffers up to MaxResponseBodyBytes; DownloadBlob streams
+// files of any size. Redirects may leave the HEY origin, and the HTTP client strips
+// authorization before following them.
+func (c *Client) GetBlob(ctx context.Context, path string) (*Response, error) {
+	resolvedURL, err := c.blobURL(path)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = contextWithAccept(ctx, "*/*")
+	ctx = contextWithoutCache(ctx)
+	return c.doRequestURL(ctx, http.MethodGet, resolvedURL, nil)
+}
+
+// DownloadBlob streams a blob to destination without placing the complete file
+// in memory. It returns the number of bytes written and the final response headers.
+func (c *Client) DownloadBlob(ctx context.Context, path string, destination io.Writer) (int64, http.Header, error) {
+	if destination == nil {
+		return 0, nil, ErrUsage("a blob download needs a destination")
+	}
+	resolvedURL, err := c.blobURL(path)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	ctx = contextWithAccept(ctx, "*/*")
+	ctx = contextWithoutCache(ctx)
+	ctx, stream := contextWithStreamDestination(ctx, destination)
+	resp, err := c.doRequestURL(ctx, http.MethodGet, resolvedURL, nil)
+	if err != nil {
+		return stream.written, nil, err
+	}
+	return stream.written, resp.Headers, nil
+}
+
+func (c *Client) blobURL(path string) (string, error) {
+	resolvedURL, err := c.buildURL(path)
+	if err != nil {
+		return "", err
+	}
+	if !isSameOrigin(c.cfg.BaseURL, resolvedURL) {
+		return "", ErrUsage("a blob URL must start on the HEY origin")
+	}
+	return resolvedURL, nil
+}
+
 // GetCSV performs a GET request with Accept: text/csv, returning the raw CSV bytes.
 // Use this for the export endpoints, which stream a file rather than a document.
 func (c *Client) GetCSV(ctx context.Context, path string) (*Response, error) {
@@ -453,6 +501,34 @@ func acceptFromContext(ctx context.Context) string {
 	return "application/json"
 }
 
+type contextKeyNoCache struct{}
+
+func contextWithoutCache(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyNoCache{}, true)
+}
+
+func noCacheFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(contextKeyNoCache{}).(bool)
+	return v
+}
+
+type contextKeyStreamDestination struct{}
+
+type streamDestination struct {
+	writer  io.Writer
+	written int64
+}
+
+func contextWithStreamDestination(ctx context.Context, writer io.Writer) (context.Context, *streamDestination) {
+	destination := &streamDestination{writer: writer}
+	return context.WithValue(ctx, contextKeyStreamDestination{}, destination), destination
+}
+
+func streamDestinationFromContext(ctx context.Context) *streamDestination {
+	destination, _ := ctx.Value(contextKeyStreamDestination{}).(*streamDestination)
+	return destination
+}
+
 func (c *Client) doRequest(ctx context.Context, method, path string, body any) (*Response, error) {
 	url, err := c.buildURL(path)
 	if err != nil {
@@ -547,7 +623,7 @@ func (c *Client) singleRequest(ctx context.Context, method, url string, body any
 	req.Header.Set("Accept", acceptFromContext(ctx))
 
 	var cacheKey string
-	if method == "GET" && c.cache != nil {
+	if method == http.MethodGet && c.cache != nil && !noCacheFromContext(ctx) {
 		cacheKey = c.cache.Key(url, req.Header.Get("Authorization"))
 		if etag := c.cache.GetETag(cacheKey); etag != "" {
 			req.Header.Set("If-None-Match", etag)
@@ -582,6 +658,13 @@ func (c *Client) singleRequest(ctx context.Context, method, url string, body any
 		return nil, ErrAPI(304, "304 received but no cached response available")
 
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		if destination := streamDestinationFromContext(ctx); destination != nil {
+			destination.written, err = io.Copy(destination.writer, resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("stream response: %w", err)
+			}
+			return &Response{StatusCode: resp.StatusCode, Headers: resp.Header}, nil
+		}
 		respBody, err := limitedReadAll(resp.Body, MaxResponseBodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %w", err)
@@ -591,7 +674,7 @@ func (c *Client) singleRequest(ctx context.Context, method, url string, body any
 			respBody = json.RawMessage("null")
 		}
 
-		if method == "GET" && cacheKey != "" {
+		if method == http.MethodGet && cacheKey != "" {
 			if etag := resp.Header.Get("ETag"); etag != "" {
 				_ = c.cache.Set(cacheKey, respBody, etag)
 				c.logger.Debug("cache stored", "etag", etag)
@@ -793,6 +876,16 @@ func (c *Client) Messages() *MessagesService {
 		c.messages = NewMessagesService(c)
 	}
 	return c.messages
+}
+
+// Attachments returns the attachment service.
+func (c *Client) Attachments() *AttachmentsService {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.attachments == nil {
+		c.attachments = NewAttachmentsService(c)
+	}
+	return c.attachments
 }
 
 // BulkReplies returns the bulk reply service, for answering many threads at once.

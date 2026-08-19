@@ -1,8 +1,10 @@
 package hey
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -90,6 +92,192 @@ func TestClient_Get(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestClient_GetBlob(t *testing.T) {
+	binary := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe}
+	var requests atomic.Int64
+	var lastIfNoneMatch atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		lastIfNoneMatch.Store(r.Header.Get("If-None-Match"))
+		if got := r.Header.Get("Accept"); got != "*/*" {
+			t.Errorf("Accept = %q, want %q", got, "*/*")
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(binary)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(
+		&Config{BaseURL: server.URL},
+		&StaticTokenProvider{Token: "test-token"},
+		WithMaxRetries(0),
+		WithBaseDelay(time.Millisecond),
+		WithMaxJitter(time.Millisecond),
+		WithCache(NewCache(t.TempDir())),
+	)
+
+	for i := 0; i < 2; i++ {
+		resp, err := client.GetBlob(context.Background(), "/rails/blobs/abc/image.png")
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want %d", i+1, resp.StatusCode, http.StatusOK)
+		}
+		if !bytes.Equal(resp.Data, binary) {
+			t.Fatalf("request %d body = %d bytes, want %d", i+1, len(resp.Data), len(binary))
+		}
+		if resp.FromCache {
+			t.Errorf("request %d unexpectedly came from cache", i+1)
+		}
+		if value, _ := lastIfNoneMatch.Load().(string); value != "" {
+			t.Errorf("request %d If-None-Match = %q, want empty", i+1, value)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Errorf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestClient_GetBlobRejectsCrossOriginURL(t *testing.T) {
+	client := newTestClient(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("cross-origin blob URL should be rejected before making a request")
+	})
+
+	_, err := client.GetBlob(context.Background(), "https://files.example.org/report.pdf")
+	sdkErr, ok := err.(*Error)
+	if !ok || sdkErr.Code != CodeUsage {
+		t.Fatalf("cross-origin error = %v, want usage", err)
+	}
+}
+
+func TestClient_GetBlobStripsAuthorizationOnCrossOriginRedirect(t *testing.T) {
+	binary := []byte{0x00, 0xff, 0x01, 0xfe}
+	var targetAuthorization atomic.Value
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetAuthorization.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(binary)
+	}))
+	t.Cleanup(target.Close)
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("source Authorization = %q, want Bearer token", got)
+		}
+		http.Redirect(w, r, target.URL+"/download/file.bin", http.StatusFound)
+	}))
+	t.Cleanup(source.Close)
+
+	client := NewClient(
+		&Config{BaseURL: source.URL},
+		&StaticTokenProvider{Token: "test-token"},
+		WithMaxRetries(0),
+	)
+	resp, err := client.GetBlob(context.Background(), "/rails/active_storage/blobs/redirect/abc/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(resp.Data, binary) {
+		t.Fatalf("body = %v, want %v", resp.Data, binary)
+	}
+	if got, _ := targetAuthorization.Load().(string); got != "" {
+		t.Errorf("target Authorization = %q, want empty", got)
+	}
+}
+
+func TestClient_DownloadBlobStreamsCrossOriginRedirect(t *testing.T) {
+	binary := []byte{0x00, 0xff, 0x01, 0xfe}
+	var targetAuthorization atomic.Value
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetAuthorization.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(binary)
+	}))
+	t.Cleanup(target.Close)
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("source Authorization = %q, want Bearer token", got)
+		}
+		http.Redirect(w, r, target.URL+"/download/file.bin", http.StatusFound)
+	}))
+	t.Cleanup(source.Close)
+
+	client := NewClient(
+		&Config{BaseURL: source.URL},
+		&StaticTokenProvider{Token: "test-token"},
+		WithMaxRetries(0),
+	)
+	var destination bytes.Buffer
+	written, headers, err := client.DownloadBlob(context.Background(), "/rails/active_storage/blobs/redirect/abc/file.bin", &destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != int64(len(binary)) || !bytes.Equal(destination.Bytes(), binary) {
+		t.Fatalf("download = %d bytes %v, want %v", written, destination.Bytes(), binary)
+	}
+	if headers.Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("Content-Type = %q", headers.Get("Content-Type"))
+	}
+	if got, _ := targetAuthorization.Load().(string); got != "" {
+		t.Errorf("target Authorization = %q, want empty", got)
+	}
+}
+
+type failingStreamWriter struct {
+	limit   int
+	written int
+}
+
+func (w *failingStreamWriter) Write(data []byte) (int, error) {
+	remaining := w.limit - w.written
+	if remaining <= 0 {
+		return 0, errors.New("destination failed")
+	}
+	if len(data) > remaining {
+		w.written += remaining
+		return remaining, errors.New("destination failed")
+	}
+	w.written += len(data)
+	return len(data), nil
+}
+
+func TestClient_DownloadBlobDoesNotRetryPartialWrites(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte("streamed attachment"))
+	}))
+	t.Cleanup(server.Close)
+	client := NewClient(
+		&Config{BaseURL: server.URL},
+		&StaticTokenProvider{Token: "test-token"},
+		WithMaxRetries(3),
+		WithBaseDelay(time.Millisecond),
+		WithMaxJitter(time.Millisecond),
+	)
+	destination := &failingStreamWriter{limit: 4}
+	written, _, err := client.DownloadBlob(context.Background(), "/blob", destination)
+	if err == nil || written != 4 {
+		t.Fatalf("DownloadBlob = %d, %v", written, err)
+	}
+	if requests.Load() != 1 {
+		t.Errorf("requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestClient_DownloadBlobRequiresDestination(t *testing.T) {
+	client := newTestClient(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("nil destination should be rejected before making a request")
+	})
+	if _, _, err := client.DownloadBlob(context.Background(), "/blob", nil); err == nil {
+		t.Fatal("expected destination error")
 	}
 }
 
@@ -266,6 +454,9 @@ func TestClient_ServiceAccessors(t *testing.T) {
 	}
 	if c.Messages() == nil {
 		t.Fatal("expected non-nil MessagesService")
+	}
+	if c.Attachments() == nil {
+		t.Fatal("expected non-nil AttachmentsService")
 	}
 	if c.Entries() == nil {
 		t.Fatal("expected non-nil EntriesService")
