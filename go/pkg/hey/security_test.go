@@ -1,10 +1,17 @@
 package hey
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRequireHTTPS(t *testing.T) {
@@ -122,6 +129,67 @@ func TestRedactHeaders(t *testing.T) {
 	if h.Get("Authorization") != "Bearer secret" {
 		t.Fatal("expected original header unchanged")
 	}
+}
+
+func TestRequestLogsExcludeUserProvidedURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := NewClient(
+		&Config{BaseURL: server.URL},
+		&StaticTokenProvider{Token: "token"},
+		WithLogger(logger),
+	)
+	if _, err := client.Get(context.Background(), "/messages.json?subject=forged-document-log-entry"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PostForm(
+		context.Background(),
+		"/messages.json?subject=forged-form-log-entry",
+		url.Values{"body": {"hello"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	output := logs.String()
+	if strings.Contains(output, "forged-document-log-entry") || strings.Contains(output, "forged-form-log-entry") {
+		t.Fatalf("request URL reached logs: %s", output)
+	}
+	if !strings.Contains(output, "method=GET") {
+		t.Fatalf("request method missing from logs: %s", output)
+	}
+
+	logs.Reset()
+	failingClient := NewClient(
+		&Config{BaseURL: "https://example.com"},
+		&StaticTokenProvider{Token: "token"},
+		WithLogger(logger),
+		WithTransport(failingRoundTripper{}),
+		WithMaxRetries(1),
+		WithBaseDelay(time.Nanosecond),
+		WithMaxJitter(time.Nanosecond),
+	)
+	if _, err := failingClient.Get(context.Background(), "/messages.json?subject=forged-network-log-entry"); err == nil {
+		t.Fatal("failing request returned no error")
+	}
+	output = logs.String()
+	if strings.Contains(output, "forged-network-log-entry") {
+		t.Fatalf("network error URL reached logs: %s", output)
+	}
+	if !strings.Contains(output, "errorCode=network") {
+		t.Fatalf("network error code missing from retry log: %s", output)
+	}
+}
+
+type failingRoundTripper struct{}
+
+func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("connection failed")
 }
 
 func TestLimitedReadAll(t *testing.T) {
