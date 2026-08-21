@@ -21,8 +21,24 @@ func NewClearancesService(client *Client) *ClearancesService {
 // PendingCount answers how many senders are waiting, without fetching them.
 //
 // This is the cheap read HEY's own apps sync for the Screener badge. Use Pending when you
-// want the senders themselves.
+// want the senders themselves, or Summary when you also want the stream to follow.
 func (s *ClearancesService) PendingCount(ctx context.Context) (count int, err error) {
+	summary, err := s.Summary(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if summary == nil {
+		return 0, nil
+	}
+	return int(summary.PendingClearancesCount), nil
+}
+
+// Summary answers everything HEY says about the Screener without the queue itself: how
+// many senders are waiting, and the signed stream name to subscribe to on HEY's cable
+// server to be told when that changes.
+//
+// It is the same read as PendingCount — the count alone, no queue dragged along.
+func (s *ClearancesService) Summary(ctx context.Context) (summary *generated.ClearanceSummary, err error) {
 	op := OperationInfo{
 		Service: "Clearances", Operation: "GetClearances",
 		ResourceType: "clearance", IsMutation: false,
@@ -36,12 +52,10 @@ func (s *ClearancesService) PendingCount(ctx context.Context) (count int, err er
 		if cerr := CheckResponse(resp.HTTPResponse); cerr != nil {
 			return cerr
 		}
-		if resp.JSON200 != nil {
-			count = int(resp.JSON200.PendingClearancesCount)
-		}
+		summary = resp.JSON200
 		return nil
 	})
-	return count, err
+	return summary, err
 }
 
 // Pending answers the senders waiting to be screened, a page at a time.
