@@ -41,8 +41,16 @@ type CreateCalendarEventParams struct {
 	StartTime string
 	// EndTime is the end time in HH:MM format (required if not all-day).
 	EndTime string
-	// TimeZone is the IANA timezone name (e.g., "America/New_York").
-	// Required for timed events.
+	// StartTimeZone and EndTimeZone are the IANA names of the zones the clock times above are
+	// written in — "Europe/Zagreb", "America/New_York". Leave them empty and the times are
+	// read in UTC, which is the zone HEY parses an API request in. HEY keeps a zone per end,
+	// as its own form offers, so an event can start in one and finish in another.
+	StartTimeZone string
+	EndTimeZone   string
+	// TimeZone names one zone for both ends.
+	//
+	// Deprecated: use StartTimeZone and EndTimeZone. It stands in for whichever of them is
+	// empty, so a caller that only ever wanted one zone keeps working.
 	TimeZone string
 	// Reminders is a list of durations before the event to send reminders.
 	// The API accepts any duration, not just the presets in the web UI.
@@ -51,15 +59,74 @@ type CreateCalendarEventParams struct {
 
 // UpdateCalendarEventParams contains the parameters for updating a calendar event.
 // Only non-nil fields are updated.
+//
+// The zones are the exception, and the reason is on HEY's side: it reads the pair out of the
+// submitted parameters or nils both, so an update that says nothing about them clears whatever
+// the event had. A caller keeping a zoned event's zones has to send them again.
 type UpdateCalendarEventParams struct {
-	Title     *string
-	StartsAt  *string
-	EndsAt    *string
-	AllDay    *bool
-	StartTime *string
-	EndTime   *string
+	// CalendarID moves the event to another calendar. An update takes the same calendar as a
+	// create does, which is how the web app's calendar select relocates an event.
+	//
+	// It has to be a calendar the identity can file on — one it owns or shares, and not a
+	// subscription. The personal calendar is the one that catches you out: it is in the list
+	// Identity serves, and filing on it answers 404 all the same.
+	CalendarID *int64
+	Title      *string
+	StartsAt   *string
+	EndsAt     *string
+	AllDay     *bool
+	StartTime  *string
+	EndTime    *string
+	// StartTimeZone and EndTimeZone are the zones the clock times are written in, as on a
+	// create. Empty strings say the times are UTC and clear the zones the event was saved
+	// with; nil leaves them out of the request, which HEY also reads as clearing them.
+	StartTimeZone *string
+	EndTimeZone   *string
+	// TimeZone names one zone for both ends.
+	//
+	// Deprecated: use StartTimeZone and EndTimeZone. It stands in for whichever of them is
+	// nil, so a caller that only ever wanted one zone keeps working.
 	TimeZone  *string
 	Reminders []time.Duration
+}
+
+// setTimeZones writes the zones a timed event's clock times are written in, and the flag that
+// makes HEY honour them. The flag is not decoration: without it both names are dropped and the
+// times are read in UTC, so 08:00 sent from Zagreb is stored as 08:00Z.
+//
+// Naming no zone is a complete answer rather than an omission — convert to UTC and say nothing.
+// An all-day event does not come through here at all, since a date has no zone.
+// timeZoneOr and timeZonePointerOr let the deprecated TimeZone stand in for an end the caller
+// did not name.
+func timeZoneOr(zone, both string) string {
+	if zone == "" {
+		return both
+	}
+	return zone
+}
+
+func timeZonePointerOr(zone, both *string) *string {
+	if zone == nil {
+		return both
+	}
+	return zone
+}
+
+func setTimeZones(values url.Values, start, end string) {
+	if start == "" && end == "" {
+		values.Set("calendar_event[set_time_zone]", "0")
+		return
+	}
+	// An empty name is read as no name, which lands that end back in UTC.
+	if start == "" {
+		start = end
+	}
+	if end == "" {
+		end = start
+	}
+	values.Set("calendar_event[set_time_zone]", "1")
+	values.Set("calendar_event[starts_at_time_zone_name]", start)
+	values.Set("calendar_event[ends_at_time_zone_name]", end)
 }
 
 // Create creates a new calendar event and returns it as a recording.
@@ -99,8 +166,9 @@ func (s *CalendarEventsService) Create(ctx context.Context, params CreateCalenda
 		values.Set("calendar_event[all_day]", "0")
 		values.Set("calendar_event[starts_at_time]", params.StartTime+":00")
 		values.Set("calendar_event[ends_at_time]", params.EndTime+":00")
-		values.Set("calendar_event[starts_at_time_zone_name]", params.TimeZone)
-		values.Set("calendar_event[ends_at_time_zone_name]", params.TimeZone)
+		setTimeZones(values,
+			timeZoneOr(params.StartTimeZone, params.TimeZone),
+			timeZoneOr(params.EndTimeZone, params.TimeZone))
 		for _, r := range params.Reminders {
 			values.Add("timed_reminder_durations[]", fmt.Sprintf("%d", int64(r.Seconds())))
 		}
@@ -172,9 +240,20 @@ func (s *CalendarEventsService) Update(ctx context.Context, eventID int64, param
 	if params.EndTime != nil {
 		values.Set("calendar_event[ends_at_time]", *params.EndTime+":00")
 	}
-	if params.TimeZone != nil {
-		values.Set("calendar_event[starts_at_time_zone_name]", *params.TimeZone)
-		values.Set("calendar_event[ends_at_time_zone_name]", *params.TimeZone)
+	if params.CalendarID != nil {
+		values.Set("calendar_event[calendar_id]", fmt.Sprintf("%d", *params.CalendarID))
+	}
+	startZone := timeZonePointerOr(params.StartTimeZone, params.TimeZone)
+	endZone := timeZonePointerOr(params.EndTimeZone, params.TimeZone)
+	if startZone != nil || endZone != nil {
+		var start, end string
+		if startZone != nil {
+			start = *startZone
+		}
+		if endZone != nil {
+			end = *endZone
+		}
+		setTimeZones(values, start, end)
 	}
 	if params.Reminders != nil {
 		allDay := params.AllDay != nil && *params.AllDay
