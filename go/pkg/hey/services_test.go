@@ -1626,6 +1626,38 @@ func TestCalendarEventsService_Update(t *testing.T) {
 	}
 }
 
+// An all-day update carries dates without clock times.
+func TestCalendarEventsService_Update_AllDayOmitsClockTimes(t *testing.T) {
+	client := newFormJSONTestClient(t, "PATCH", "/calendar/events/%s",
+		func(t *testing.T, values url.Values) {
+			assertFormFields(t, values, map[string]string{
+				"calendar_event[all_day]": "1",
+			},
+				"calendar_event[starts_at_time]",
+				"calendar_event[ends_at_time]",
+			)
+		},
+		200, `{"id": 99, "title": "Sarah's birthday", "type": "Calendar::Event", "all_day": true}`,
+	)
+
+	title := "Sarah's birthday"
+	startsAt := "2026-09-02"
+	endsAt := "2026-09-02"
+	allDay := true
+	empty := ""
+	_, err := client.CalendarEvents().Update(context.Background(), 99, UpdateCalendarEventParams{
+		Title:     &title,
+		StartsAt:  &startsAt,
+		EndsAt:    &endsAt,
+		AllDay:    &allDay,
+		StartTime: &empty,
+		EndTime:   &empty,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // An event can start in one zone and finish in another, which is what a flight is.
 func TestCalendarEventsService_Update_WithAZonePerEnd(t *testing.T) {
 	departs, arrives := "Europe/Zagreb", "America/New_York"
