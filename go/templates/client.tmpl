@@ -51,6 +51,12 @@ type {{ $clientTypeName }} struct {
 	// RetryConfig for idempotent operations
 	RetryConfig RetryConfig
 
+	// AuthRefresher is asked once when a response is 401. It renews whatever the request
+	// editors authenticate with and reports whether it could; when it could, the request
+	// is built and sent once more. A 401 means the server did not act on the request, so
+	// this retry is safe for non-idempotent operations too (optional).
+	AuthRefresher func(ctx context.Context) bool
+
 	// Logger for debug output (optional)
 	Logger *slog.Logger
 }
@@ -108,6 +114,15 @@ func WithRetryConfig(cfg RetryConfig) ClientOption {
 	}
 }
 
+// WithAuthRefresher sets the callback a 401 response consults before the request is
+// sent once more with renewed credentials.
+func WithAuthRefresher(fn func(ctx context.Context) bool) ClientOption {
+	return func(c *{{ $clientTypeName }}) error {
+		c.AuthRefresher = fn
+		return nil
+	}
+}
+
 // WithLogger allows setting a custom logger for debug output.
 func WithLogger(logger *slog.Logger) ClientOption {
 	return func(c *{{ $clientTypeName }}) error {
@@ -130,12 +145,75 @@ func isRetryableStatus(statusCode int) bool {
 	}
 }
 
-// doWithRetry executes a request with retry logic for idempotent operations.
+// doWithRetry executes a request with retry logic for idempotent operations, and sends
+// it once more after a 401 the AuthRefresher was able to answer. That resend draws on
+// whatever retry budget the operation has left rather than starting a fresh one, and is
+// always granted at least the one attempt.
 func (c *{{ $clientTypeName }}) doWithRetry(ctx context.Context, buildRequest func() (*http.Request, error), isIdempotent bool, operationId string, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	maxAttempts := 1
 	if isIdempotent {
 		maxAttempts = c.RetryConfig.MaxRetries + 1
 	}
+	made := 0
+	resp, err := c.doAttempts(ctx, func() (*http.Request, error) {
+		made++
+		return buildRequest()
+	}, maxAttempts, operationId, reqEditors...)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized || c.AuthRefresher == nil || !c.AuthRefresher(ctx) {
+		return resp, err
+	}
+	_ = resp.Body.Close()
+	if c.Logger != nil {
+		c.Logger.Debug("credentials refreshed, retrying", "operation", operationId)
+	}
+	return c.doAttempts(ctx, buildRequest, max(maxAttempts-made, 1), operationId, reqEditors...)
+}
+
+// resendableBody makes a request body good for more than one send, since every attempt
+// builds its request afresh from the same reader: a seekable body is rewound to where it
+// started, and any other body is held in memory. The returned rewind runs before each
+// build. The returned finish runs once the last response is in and closes a body that
+// closes: the transport closes whatever body it is handed after each send, so a body
+// that has to survive a resend is kept from it and closed here instead.
+func resendableBody(body io.Reader) (io.Reader, func() error, func()) {
+	finish := func() {
+		if closer, ok := body.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	if body == nil {
+		return nil, func() error { return nil }, finish
+	}
+	if seeker, ok := body.(io.ReadSeeker); ok {
+		if start, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			rewind := func() error {
+				_, err := seeker.Seek(start, io.SeekStart)
+				return err
+			}
+			if _, closes := body.(io.Closer); closes {
+				return readOnly{seeker}, rewind, finish
+			}
+			return seeker, rewind, finish
+		}
+	}
+	buf, err := io.ReadAll(body)
+	held := bytes.NewReader(buf)
+	return held, func() error {
+		if err != nil {
+			return err
+		}
+		_, err := held.Seek(0, io.SeekStart)
+		return err
+	}, finish
+}
+
+// readOnly hides a body's Close from http.NewRequest, which installs an io.ReadCloser
+// as the request body as-is and so hands its closing to the transport.
+type readOnly struct{ io.Reader }
+
+// doAttempts runs the retry loop for up to maxAttempts sends, retrying transient
+// failures with backoff between them.
+func (c *{{ $clientTypeName }}) doAttempts(ctx context.Context, buildRequest func() (*http.Request, error), maxAttempts int, operationId string, reqEditors ...RequestEditorFn) (*http.Response, error) {
 
 	var lastResp *http.Response
 	var lastErr error
@@ -161,8 +239,8 @@ func (c *{{ $clientTypeName }}) doWithRetry(ctx context.Context, buildRequest fu
 					"error", err,
 				)
 			}
-			// Network errors are retryable for idempotent operations
-			if isIdempotent && attempt < maxAttempts {
+			// Network errors are retryable while attempts remain
+			if attempt < maxAttempts {
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -191,8 +269,8 @@ func (c *{{ $clientTypeName }}) doWithRetry(ctx context.Context, buildRequest fu
 			)
 		}
 
-		// Don't retry if not idempotent or last attempt
-		if !isIdempotent || attempt >= maxAttempts {
+		// Don't retry past the last attempt
+		if attempt >= maxAttempts {
 			return resp, nil
 		}
 
@@ -273,41 +351,22 @@ type ClientInterface interface {
 // {{$opid}}{{if .HasBody}}WithBody{{end}} executes the {{$opid}} operation.
 {{end}}
 func (c *{{ $clientTypeName }}) {{$opid}}{{if .HasBody}}WithBody{{end}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}{{if .HasBody}}, contentType string, body io.Reader{{end}}, reqEditors... RequestEditorFn) (*http.Response, error) {
-{{if $isIdempotent}}
-    return c.doWithRetry(ctx, func() (*http.Request, error) {
-        return New{{$opid}}Request{{if .HasBody}}WithBody{{end}}(c.Server{{genParamNames .PathParams}}{{if $hasParams}}, params{{end}}{{if .HasBody}}, contentType, body{{end}})
-    }, true, "{{$opid}}", reqEditors...)
-{{else}}
-    req, err := New{{$opid}}Request{{if .HasBody}}WithBody{{end}}(c.Server{{genParamNames .PathParams}}{{if $hasParams}}, params{{end}}{{if .HasBody}}, contentType, body{{end}})
-    if err != nil {
-        return nil, err
-    }
-    req = req.WithContext(ctx)
-    if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-        return nil, err
-    }
-    return c.Client.Do(req)
-{{end}}
+{{if .HasBody}}    body, rewind, finish := resendableBody(body)
+    defer finish()
+{{end}}    return c.doWithRetry(ctx, func() (*http.Request, error) {
+{{if .HasBody}}        if err := rewind(); err != nil {
+            return nil, err
+        }
+{{end}}        return New{{$opid}}Request{{if .HasBody}}WithBody{{end}}(c.Server{{genParamNames .PathParams}}{{if $hasParams}}, params{{end}}{{if .HasBody}}, contentType, body{{end}})
+    }, {{$isIdempotent}}, "{{$opid}}", reqEditors...)
 }
 
 {{range .Bodies}}
 {{if .IsSupportedByClient -}}
 func (c *{{ $clientTypeName }}) {{$opid}}{{.Suffix}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody, reqEditors... RequestEditorFn) (*http.Response, error) {
-{{if $isIdempotent}}
     return c.doWithRetry(ctx, func() (*http.Request, error) {
         return New{{$opid}}Request{{.Suffix}}(c.Server{{genParamNames $pathParams}}{{if $hasParams}}, params{{end}}, body)
-    }, true, "{{$opid}}", reqEditors...)
-{{else}}
-    req, err := New{{$opid}}Request{{.Suffix}}(c.Server{{genParamNames $pathParams}}{{if $hasParams}}, params{{end}}, body)
-    if err != nil {
-        return nil, err
-    }
-    req = req.WithContext(ctx)
-    if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-        return nil, err
-    }
-    return c.Client.Do(req)
-{{end}}
+    }, {{$isIdempotent}}, "{{$opid}}", reqEditors...)
 }
 {{end -}}{{/* if .IsSupported */}}
 {{end}}{{/* range .Bodies */}}
