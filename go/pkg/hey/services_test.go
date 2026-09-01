@@ -3701,6 +3701,22 @@ func TestWorkflowsService_Stages(t *testing.T) {
 	}
 }
 
+func TestWorkflowsService_GetStage(t *testing.T) {
+	client := newServiceTestClient(t, map[string]string{
+		"/workflows/8801/stages/5512": `<section id="container_workflow_stage_5512"><h2>Applied</h2><div class="workflow__card" id="topic_4471829" data-identifier="91"><h3>Application</h3><p class="card__detail">3 emails</p></div></section>`,
+	})
+	stage, err := client.Workflows().GetStage(context.Background(), 8801, 5512)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if stage == nil || stage.ID != 5512 || stage.Name != "Applied" || len(stage.Topics) != 1 {
+		t.Fatalf("unexpected stage: %+v", stage)
+	}
+	if topic := stage.Topics[0]; topic.TopicID != 4471829 || topic.StagingID != 91 || topic.Subject != "Application" || topic.EntryCount != 3 {
+		t.Errorf("unexpected topic: %+v", topic)
+	}
+}
+
 func TestWorkflowsService_Writes(t *testing.T) {
 	creator := newFormTestClient(t, "POST", "/workflows", func(t *testing.T, values url.Values) {
 		t.Helper()

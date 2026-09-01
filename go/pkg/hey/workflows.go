@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/net/html"
+
 	"github.com/basecamp/hey-sdk/go/pkg/generated"
 )
 
@@ -29,6 +31,22 @@ type Workflow struct {
 	ID          int64
 	Name        string
 	AccountName string
+}
+
+// WorkflowStageTopic is a thread card in a workflow stage.
+// StagingID identifies the workflow membership; TopicID identifies the email thread.
+type WorkflowStageTopic struct {
+	StagingID  int64
+	TopicID    int64
+	Subject    string
+	EntryCount int
+}
+
+// WorkflowStageView is the stage page HEY renders, including its thread cards.
+type WorkflowStageView struct {
+	ID     int64
+	Name   string
+	Topics []WorkflowStageTopic
 }
 
 // List returns the workflows on an account.
@@ -98,6 +116,97 @@ func (s *WorkflowsService) Stages(ctx context.Context, workflowID int64) ([]gene
 		return nil, err
 	}
 	return workflow.Stages, nil
+}
+
+// GetStage reads the threads in one workflow stage. HEY currently serves this resource as
+// HTML rather than JSON, so this is deliberately kept in the SDK's workflow compatibility layer.
+func (s *WorkflowsService) GetStage(ctx context.Context, workflowID, stageID int64) (result *WorkflowStageView, err error) {
+	op := OperationInfo{Service: "Workflows", Operation: "GetWorkflowStage", ResourceType: "workflow_stage", IsMutation: false, ResourceID: stageID}
+	err = s.client.instrument(ctx, op, func(ctx context.Context) error {
+		resp, rerr := s.client.GetHTML(ctx, fmt.Sprintf("/workflows/%d/stages/%d", workflowID, stageID))
+		if rerr != nil {
+			return rerr
+		}
+		result, err = parseWorkflowStageHTML(resp.Data, stageID)
+		return err
+	})
+	return result, err
+}
+
+func parseWorkflowStageHTML(source []byte, wantStageID int64) (*WorkflowStageView, error) {
+	doc, err := html.Parse(strings.NewReader(string(source)))
+	if err != nil {
+		return nil, fmt.Errorf("parse workflow stage: %w", err)
+	}
+	stage := findNode(doc, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && attr(n, "id") == fmt.Sprintf("container_workflow_stage_%d", wantStageID)
+	})
+	if stage == nil {
+		return nil, fmt.Errorf("workflow stage %d not found", wantStageID)
+	}
+	result := &WorkflowStageView{ID: wantStageID}
+	if heading := findNode(stage, func(n *html.Node) bool { return n.Type == html.ElementNode && n.Data == "h2" }); heading != nil {
+		result.Name = nodeText(heading)
+	}
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && strings.HasPrefix(attr(n, "id"), "topic_") {
+			topicID, _ := strconv.ParseInt(strings.TrimPrefix(attr(n, "id"), "topic_"), 10, 64)
+			stagingID, _ := strconv.ParseInt(attr(n, "data-identifier"), 10, 64)
+			if topicID != 0 {
+				topic := WorkflowStageTopic{TopicID: topicID, StagingID: stagingID}
+				if title := findNode(n, func(x *html.Node) bool { return x.Type == html.ElementNode && x.Data == "h3" }); title != nil {
+					topic.Subject = nodeText(title)
+				}
+				if detail := findNode(n, func(x *html.Node) bool {
+					return x.Type == html.ElementNode && x.Data == "p" && strings.Contains(attr(x, "class"), "card__detail")
+				}); detail != nil {
+					fmt.Sscanf(nodeText(detail), "%d", &topic.EntryCount)
+				}
+				result.Topics = append(result.Topics, topic)
+			}
+			return
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(stage)
+	return result, nil
+}
+
+func findNode(node *html.Node, match func(*html.Node) bool) *html.Node {
+	if match(node) {
+		return node
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if found := findNode(child, match); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+func attr(node *html.Node, name string) string {
+	for _, value := range node.Attr {
+		if value.Key == name {
+			return value.Val
+		}
+	}
+	return ""
+}
+func nodeText(node *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(node)
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // Create adds a workflow. accountID of zero leaves the server to pick your first account.
