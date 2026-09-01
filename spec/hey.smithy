@@ -247,6 +247,7 @@ service HEY {
         ListClips
         ListSnippets
         GetWorkflow
+        GetWorkflowStage
         CreateWorkflowStaging
         MoveWorkflowStaging
         GetTopicPublication
@@ -453,6 +454,9 @@ structure WorkflowStage {
     id: Long
     name: String
 }
+
+@mediaType("text/html")
+blob WorkflowStageHTML
 
 list WorkflowStageList {
     member: WorkflowStage
@@ -4457,6 +4461,31 @@ operation GetWorkflow {
     input: GetWorkflowInput
     output: GetWorkflowOutput
     errors: [UnauthorizedError, NotFoundError, InternalServerError, ServiceUnavailableError]
+}
+
+/// A workflow stage and its cards, served as HTML by HEY.
+@readonly
+@http(method: "GET", uri: "/workflows/{workflowId}/stages/{stageId}")
+@tags(["Workflows"])
+operation GetWorkflowStage {
+    input: GetWorkflowStageInput
+    output: GetWorkflowStageOutput
+    errors: [UnauthorizedError, NotFoundError, InternalServerError, ServiceUnavailableError]
+}
+
+structure GetWorkflowStageInput {
+    @httpLabel
+    @required
+    workflowId: Long
+    @httpLabel
+    @required
+    stageId: Long
+}
+
+structure GetWorkflowStageOutput {
+    @httpPayload
+    @required
+    body: WorkflowStageHTML
 }
 
 structure GetWorkflowInput {

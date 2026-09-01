@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -118,16 +119,26 @@ func (s *WorkflowsService) Stages(ctx context.Context, workflowID int64) ([]gene
 	return workflow.Stages, nil
 }
 
-// GetStage reads the threads in one workflow stage. HEY currently serves this resource as
-// HTML rather than JSON, so this is deliberately kept in the SDK's workflow compatibility layer.
+// GetStage reads the threads in one workflow stage. HEY serves this resource as HTML.
 func (s *WorkflowsService) GetStage(ctx context.Context, workflowID, stageID int64) (result *WorkflowStageView, err error) {
 	op := OperationInfo{Service: "Workflows", Operation: "GetWorkflowStage", ResourceType: "workflow_stage", IsMutation: false, ResourceID: stageID}
 	err = s.client.instrument(ctx, op, func(ctx context.Context) error {
-		resp, rerr := s.client.GetHTML(ctx, fmt.Sprintf("/workflows/%d/stages/%d", workflowID, stageID))
+		resp, rerr := s.client.genClient().GetWorkflowStageWithResponse(ctx, workflowID, stageID, func(_ context.Context, req *http.Request) error {
+			req.URL.Path = strings.TrimSuffix(req.URL.Path, ".json")
+			if req.URL.RawPath != "" {
+				req.URL.RawPath = strings.TrimSuffix(req.URL.RawPath, ".json")
+			}
+			req.Header.Del("Content-Type")
+			req.Header.Set("Accept", "text/html")
+			return nil
+		})
 		if rerr != nil {
 			return rerr
 		}
-		result, err = parseWorkflowStageHTML(resp.Data, stageID)
+		if cerr := CheckResponse(resp.HTTPResponse); cerr != nil {
+			return cerr
+		}
+		result, err = parseWorkflowStageHTML(resp.Body, stageID)
 		return err
 	})
 	return result, err
@@ -146,25 +157,37 @@ func parseWorkflowStageHTML(source []byte, wantStageID int64) (*WorkflowStageVie
 	}
 	result := &WorkflowStageView{ID: wantStageID}
 	if heading := findNode(stage, func(n *html.Node) bool { return n.Type == html.ElementNode && n.Data == "h2" }); heading != nil {
-		result.Name = nodeText(heading)
+		result.Name = visibleNodeText(heading)
 	}
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode && strings.HasPrefix(attr(n, "id"), "topic_") {
-			topicID, _ := strconv.ParseInt(strings.TrimPrefix(attr(n, "id"), "topic_"), 10, 64)
-			stagingID, _ := strconv.ParseInt(attr(n, "data-identifier"), 10, 64)
-			if topicID != 0 {
-				topic := WorkflowStageTopic{TopicID: topicID, StagingID: stagingID}
-				if title := findNode(n, func(x *html.Node) bool { return x.Type == html.ElementNode && x.Data == "h3" }); title != nil {
-					topic.Subject = nodeText(title)
-				}
-				if detail := findNode(n, func(x *html.Node) bool {
-					return x.Type == html.ElementNode && x.Data == "p" && strings.Contains(attr(x, "class"), "card__detail")
-				}); detail != nil {
-					fmt.Sscanf(nodeText(detail), "%d", &topic.EntryCount)
-				}
-				result.Topics = append(result.Topics, topic)
+			topicID, topicErr := strconv.ParseInt(strings.TrimPrefix(attr(n, "id"), "topic_"), 10, 64)
+			if topicErr != nil || topicID <= 0 {
+				return
 			}
+			stagingID, stagingErr := strconv.ParseInt(attr(n, "data-identifier"), 10, 64)
+			if stagingErr != nil || stagingID <= 0 {
+				return
+			}
+			topic := WorkflowStageTopic{StagingID: stagingID, TopicID: topicID}
+			if title := findNode(n, func(x *html.Node) bool { return x.Type == html.ElementNode && x.Data == "h3" }); title != nil {
+				topic.Subject = visibleNodeText(title)
+			}
+			if detail := findNode(n, func(x *html.Node) bool {
+				return x.Type == html.ElementNode && x.Data == "p" && strings.Contains(attr(x, "class"), "card__detail")
+			}); detail != nil {
+				fields := strings.Fields(visibleNodeText(detail))
+				if len(fields) == 0 {
+					return
+				}
+				entryCount, countErr := strconv.Atoi(fields[0])
+				if countErr != nil || entryCount < 0 {
+					return
+				}
+				topic.EntryCount = entryCount
+			}
+			result.Topics = append(result.Topics, topic)
 			return
 		}
 		for child := n.FirstChild; child != nil; child = child.NextSibling {
@@ -194,10 +217,13 @@ func attr(node *html.Node, name string) string {
 	}
 	return ""
 }
-func nodeText(node *html.Node) string {
+func visibleNodeText(node *html.Node) string {
 	var b strings.Builder
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && isVisuallyHidden(n) {
+			return
+		}
 		if n.Type == html.TextNode {
 			b.WriteString(n.Data)
 		}
@@ -207,6 +233,16 @@ func nodeText(node *html.Node) string {
 	}
 	walk(node)
 	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+func isVisuallyHidden(node *html.Node) bool {
+	for _, class := range strings.Fields(attr(node, "class")) {
+		switch class {
+		case "sr-only", "screen-reader-only", "u-for-screen-reader", "visually-hidden":
+			return true
+		}
+	}
+	return false
 }
 
 // Create adds a workflow. accountID of zero leaves the server to pick your first account.
