@@ -213,6 +213,55 @@ func TestMessagesService_SendDraft(t *testing.T) {
 	}
 }
 
+func TestDraftLifecycleCarriesTheChosenActingSender(t *testing.T) {
+	// A draft saved as an alternate identity (the reply prefill's sender) must stay
+	// that identity through every revision and the final send: HEY revises a draft
+	// from the whole of what is sent, acting_sender_id included, so a lifecycle call
+	// that fell back to the account default would hand the draft back to it.
+	senderOn := func(want float64) func(*testing.T, map[string]any) {
+		return func(t *testing.T, body map[string]any) {
+			t.Helper()
+			if got, _ := body["acting_sender_id"].(float64); got != want {
+				t.Errorf("acting_sender_id = %v, want %v", body["acting_sender_id"], want)
+			}
+		}
+	}
+	client := newDraftTestClient(t, map[string]draftTestRoute{
+		"/messages.json": {
+			method: "POST", status: 204,
+			location: "https://app.hey.com/messages/12345",
+			validate: senderOn(4242),
+		},
+		"/messages/12345.json": {
+			method: "PUT", status: 204,
+			location: "https://app.hey.com/messages/12345",
+			validate: senderOn(4242),
+		},
+		"/messages/67890.json": {
+			method: "PUT", body: `{"id":99}`,
+			validate: senderOn(42), // zero falls back to the account default
+		},
+	})
+
+	chosen := DraftContent{Subject: "From the support address", Content: "<div>…</div>", ActingSenderID: 4242}
+	if _, err := client.Messages().CreateDraft(context.Background(), chosen); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := client.Messages().UpdateDraft(context.Background(), 12345, chosen); err != nil {
+		t.Fatalf("UpdateDraft: %v", err)
+	}
+	chosen.ActingSenderID = 4242
+	chosen.To = []string{"maria@example.com"}
+	if err := client.Messages().SendDraft(context.Background(), 12345, chosen); err != nil {
+		t.Fatalf("SendDraft: %v", err)
+	}
+
+	unchosen := DraftContent{Subject: "As myself", Content: "<div>…</div>", To: []string{"maria@example.com"}}
+	if err := client.Messages().SendDraft(context.Background(), 67890, unchosen); err != nil {
+		t.Fatalf("SendDraft (default sender): %v", err)
+	}
+}
+
 func TestMessagesService_SendDraft_RequiresRecipients(t *testing.T) {
 	client := newDraftTestClient(t, nil)
 
@@ -317,12 +366,32 @@ func TestEntriesService_CreateReplyDraft(t *testing.T) {
 	})
 
 	// No recipients: unlike CreateReply, a reply draft is allowed to have nobody on it.
-	id, err := client.Entries().CreateReplyDraft(context.Background(), 10, "Re: Original subject", "<div>Drafting a reply.</div>", nil, nil, nil)
+	id, err := client.Entries().CreateReplyDraft(context.Background(), 10, 0, "Re: Original subject", "<div>Drafting a reply.</div>", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if id != 777 {
 		t.Errorf("draft entry id = %d, want 777 (from Location)", id)
+	}
+}
+
+func TestEntriesService_CreateReplyDraft_SendsTheChosenActingSender(t *testing.T) {
+	client := newDraftTestClient(t, map[string]draftTestRoute{
+		"/entries/10/replies.json": {
+			method:   "POST",
+			status:   204,
+			location: "https://app.hey.com/messages/777",
+			validate: func(t *testing.T, body map[string]any) {
+				t.Helper()
+				if got, _ := body["acting_sender_id"].(float64); got != 4242 {
+					t.Errorf("acting_sender_id = %v, want the chosen sender 4242", body["acting_sender_id"])
+				}
+			},
+		},
+	})
+
+	if _, err := client.Entries().CreateReplyDraft(context.Background(), 10, 4242, "Re: Original subject", "<div>Drafting a reply.</div>", nil, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -44,7 +44,18 @@ imbox, _ := client.Boxes().GetImbox(ctx, nil)   // postings in the Imbox
 
 // Sending: recipients are required — HEY saves an unaddressed reply as a draft.
 _ = client.Messages().Create(ctx, "Subject", "Body", []string{"someone@example.com"}, nil, nil)
-_ = client.Entries().CreateReply(ctx, entryID, "Re: Subject", "Reply body", []string{"someone@example.com"}, nil, nil)
+
+// Replying: start from the NewReply prefill — it carries the reply's subject, its
+// acting sender (0 = the account default) and the recipients HEY resolved.
+prefill, err := client.Entries().NewReply(ctx, entryID)
+if err != nil {
+	return err // nothing to reply with
+}
+var to []string
+for _, contact := range prefill.Addressed.Directly {
+	to = append(to, contact.EmailAddress)
+}
+_ = client.Entries().CreateReply(ctx, entryID, prefill.Sender.Id, prefill.Subject, "Reply body", to, nil, nil)
 
 // Postings are bulk operations, as they are in HEY.
 _ = client.Postings().MoveToSetAside(ctx, postingID)

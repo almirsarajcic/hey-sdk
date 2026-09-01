@@ -1054,6 +1054,7 @@ func executeOperation(client *generated.Client, ctx context.Context, tc TestCase
 	case "CreateReply":
 		entryId := getInt64Param(tc.PathParams, "entryId")
 		body := generated.CreateReplyJSONRequestBody{
+			ActingSenderId: getInt64Param(tc.RequestBody, "acting_sender_id"),
 			Message: generated.ReplyMessagePayload{
 				Subject: getStringParam(tc.RequestBody, "subject"),
 				Content: getStringParam(tc.RequestBody, "content"),
@@ -1496,8 +1497,49 @@ func executeHEYOperation(client *hey.Client, ctx context.Context, tc TestCase) e
 			EndTime:   getStringPtrParam(tc.RequestBody, "end_time"),
 		})
 		return err
+	case "CreateReply":
+		entryID := getInt64Param(tc.PathParams, "entryId")
+		return client.Entries().CreateReply(ctx, entryID,
+			getInt64Param(tc.RequestBody, "acting_sender_id"),
+			getStringParam(tc.RequestBody, "subject"),
+			getStringParam(tc.RequestBody, "content"),
+			getStringSliceParam(tc.RequestBody, "to"),
+			getStringSliceParam(tc.RequestBody, "cc"),
+			getStringSliceParam(tc.RequestBody, "bcc"))
+	case "CreateReplyDraft":
+		entryID := getInt64Param(tc.PathParams, "entryId")
+		_, err := client.Entries().CreateReplyDraft(ctx, entryID,
+			getInt64Param(tc.RequestBody, "acting_sender_id"),
+			getStringParam(tc.RequestBody, "subject"),
+			getStringParam(tc.RequestBody, "content"),
+			getStringSliceParam(tc.RequestBody, "to"),
+			getStringSliceParam(tc.RequestBody, "cc"),
+			getStringSliceParam(tc.RequestBody, "bcc"))
+		return err
+	case "CreateDraft":
+		_, err := client.Messages().CreateDraft(ctx, draftContentParam(tc.RequestBody))
+		return err
+	case "UpdateDraft":
+		entryID := getInt64Param(tc.PathParams, "entryId")
+		return client.Messages().UpdateDraft(ctx, entryID, draftContentParam(tc.RequestBody))
+	case "SendDraft":
+		entryID := getInt64Param(tc.PathParams, "entryId")
+		return client.Messages().SendDraft(ctx, entryID, draftContentParam(tc.RequestBody))
 	default:
 		return fmt.Errorf("HEY client conformance does not support operation: %s", tc.Operation)
+	}
+}
+
+// draftContentParam builds the DraftContent a lifecycle case sends, acting sender
+// included — the wire behavior the HEY-layer draft cases exist to pin down.
+func draftContentParam(requestBody map[string]interface{}) hey.DraftContent {
+	return hey.DraftContent{
+		ActingSenderID: getInt64Param(requestBody, "acting_sender_id"),
+		Subject:        getStringParam(requestBody, "subject"),
+		Content:        getStringParam(requestBody, "content"),
+		To:             getStringSliceParam(requestBody, "to"),
+		CC:             getStringSliceParam(requestBody, "cc"),
+		BCC:            getStringSliceParam(requestBody, "bcc"),
 	}
 }
 
