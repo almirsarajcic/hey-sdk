@@ -275,16 +275,45 @@ func (c *Client) initGeneratedClient() {
 		retryCfg.BaseDelay = max(c.httpOpts.BaseDelay, 0)
 		retryCfg.MaxDelay = max(retryCfg.MaxDelay, retryCfg.BaseDelay)
 
+		// The generated loop announces each resend the way doRequestURL does: the attempt
+		// that failed in the request info, the one about to be made alongside, the URL as
+		// the account-scoped transport will send it, and the failure as the SDK's error.
+		retryHook := func(ctx context.Context, retry generated.Retry) {
+			url := retry.Request.URL.String()
+			if scoped, err := c.accountScopedURL(url); err == nil {
+				url = scoped
+			}
+			info := RequestInfo{Method: retry.Request.Method, URL: url, Attempt: retry.Attempt - 1}
+			c.hooks.OnRetry(ctx, info, retry.Attempt, retryCause(retry))
+		}
+
 		gen, err := generated.NewClientWithResponses(serverURL,
 			generated.WithHTTPClient(c.httpClient),
 			generated.WithRetryConfig(retryCfg),
 			generated.WithAuthRefresher(c.refreshCredentials),
+			generated.WithRetryHook(retryHook),
 			generated.WithRequestEditorFn(authEditor))
 		if err != nil {
 			panic(fmt.Sprintf("hey: failed to create generated client: %v", err))
 		}
 		c.gen = gen
 	})
+}
+
+// retryCause is the failure a generated resend answers, as the hand-written path reports
+// it to OnRetry: a transport failure as the SDK's network error, a response as CheckResponse
+// classifies it, and the 401 a credential refresh answered as the retryable authentication
+// error singleRequest hands doRequestURL, since the resend is the SDK's own doing.
+func retryCause(retry generated.Retry) error {
+	if retry.Response == nil {
+		return ErrNetwork(retry.Err)
+	}
+	cause := CheckResponse(retry.Response)
+	if authErr, ok := cause.(*Error); ok && authErr.Code == CodeAuth {
+		authErr.Message = "Token refreshed"
+		authErr.Retryable = true
+	}
+	return cause
 }
 
 // withJSONExtension appends ".json" to a request path whose last segment has no
